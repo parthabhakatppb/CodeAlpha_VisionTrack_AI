@@ -7,8 +7,16 @@ import sys
 import time
 import json
 import datetime
+import threading
 from ultralytics import YOLO
 from PIL import Image
+
+try:
+    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
+    import av
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page Configuration
@@ -279,6 +287,113 @@ st.markdown("""
   ::-webkit-scrollbar { width:6px; }
   ::-webkit-scrollbar-track { background:var(--bg-deep); }
   ::-webkit-scrollbar-thumb { background:var(--primary); border-radius:3px; }
+
+  /* ══════════════════════════════════════════════════
+     MOBILE RESPONSIVE — max-width: 768px
+  ══════════════════════════════════════════════════ */
+  @media (max-width: 768px) {
+
+    /* Hero shrink */
+    .hero-banner { padding: 1.2rem 1rem; margin-bottom: 1rem; }
+    .hero-title  { font-size: 1.55rem !important; }
+    .hero-subtitle { font-size: 0.82rem; }
+    .hero-badges { gap: 0.4rem; }
+    .badge { font-size: 0.65rem; padding: 0.2rem 0.6rem; }
+
+    /* Stats: 2 columns on mobile */
+    .stats-grid {
+      grid-template-columns: repeat(2, 1fr) !important;
+      gap: 0.6rem !important;
+    }
+    .stat-value { font-size: 1.4rem !important; }
+    .stat-label { font-size: 0.68rem !important; }
+    .stat-card  { padding: 0.8rem !important; }
+
+    /* Tabs — horizontal scroll on mobile */
+    .stTabs [data-baseweb="tab-list"] {
+      overflow-x: auto !important;
+      flex-wrap: nowrap !important;
+      -webkit-overflow-scrolling: touch !important;
+      padding: 0.25rem !important;
+      gap: 0.2rem !important;
+    }
+    .stTabs [data-baseweb="tab"] {
+      font-size: 0.78rem !important;
+      padding: 0.45rem 0.7rem !important;
+      white-space: nowrap !important;
+      min-width: fit-content !important;
+    }
+
+    /* Buttons — full width, large touch targets */
+    .stButton > button {
+      width: 100% !important;
+      padding: 0.75rem 1rem !important;
+      font-size: 1rem !important;
+      min-height: 48px !important;
+    }
+
+    /* Detection table — smaller text */
+    .detection-row { padding: 0.5rem 0.7rem; }
+    .det-label { font-size: 0.85rem; }
+    .det-conf  { font-size: 0.8rem; }
+    .det-id    { width: 34px; font-size: 0.8rem; }
+
+    /* Result cards */
+    .result-card { padding: 0.9rem; }
+    .result-meta { flex-direction: column; gap: 0.3rem; font-size: 0.74rem; }
+    .result-tag  { font-size: 0.68rem; }
+
+    /* Model card */
+    .model-card { padding: 0.6rem 0.8rem; }
+    .model-card-title { font-size: 0.88rem; }
+
+    /* Info / warn boxes */
+    .info-box, .warn-box, .success-box {
+      font-size: 0.82rem;
+      padding: 0.7rem 0.85rem;
+    }
+
+    /* Results header */
+    .results-header { font-size: 1.2rem; }
+
+    /* General layout padding */
+    .main .block-container {
+      padding-left: 0.8rem !important;
+      padding-right: 0.8rem !important;
+      padding-top: 1rem !important;
+    }
+
+    /* File uploader — larger touch zone */
+    [data-testid="stFileUploader"] { min-height: 80px; }
+
+    /* Column stacking override for small screens */
+    [data-testid="stHorizontalBlock"] {
+      flex-direction: column !important;
+    }
+    [data-testid="stHorizontalBlock"] > [data-testid="stVerticalBlock"] {
+      width: 100% !important;
+      min-width: 100% !important;
+    }
+
+    /* Sidebar toggle hint */
+    [data-testid="collapsedControl"] {
+      display: flex !important;
+    }
+  }
+
+  /* Small phones */
+  @media (max-width: 400px) {
+    .hero-title  { font-size: 1.25rem !important; }
+    .stats-grid  { grid-template-columns: repeat(2, 1fr) !important; }
+    .stat-value  { font-size: 1.2rem !important; }
+    .stTabs [data-baseweb="tab"] { font-size: 0.72rem !important; padding: 0.4rem 0.55rem !important; }
+  }
+
+  /* Tablet mid-range */
+  @media (min-width: 769px) and (max-width: 1024px) {
+    .stats-grid { grid-template-columns: repeat(2, 1fr) !important; }
+    .hero-title  { font-size: 2rem !important; }
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -640,27 +755,86 @@ tab_webcam, tab_video, tab_image, tab_results, tab_about = st.tabs([
 with tab_webcam:
     st.markdown("""
     <div class="info-box">
-      📷 Streams your webcam in real-time. All detections are automatically saved to the
-      <b>Results</b> tab after you stop.
+      📷 Uses your <b>browser's camera</b> via WebRTC — works on Streamlit Cloud, mobile &amp; desktop.
+      Allow camera access when prompted by your browser.
     </div>
     """, unsafe_allow_html=True)
 
-    col1, col2, _ = st.columns([1, 1, 3])
-    with col1:
-        start_webcam = st.button("▶ Start Webcam", key="start_wc")
-    with col2:
-        stop_webcam  = st.button("⏹ Stop", key="stop_wc")
+    if not WEBRTC_AVAILABLE:
+        st.markdown("""
+        <div class="warn-box">
+          ⚠️ <b>streamlit-webrtc</b> is not installed. Run:<br>
+          <code>pip install streamlit-webrtc av</code>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        # ── Shared state between WebRTC thread and main thread ──
+        if "wc_lock" not in st.session_state:
+            st.session_state.wc_lock       = threading.Lock()
+            st.session_state.wc_dets       = []
+            st.session_state.wc_frames     = 0
+            st.session_state.wc_unique_ids = set()
+            st.session_state.wc_fps_list   = []
 
-    if start_webcam:
-        st.session_state.webcam_running = True
-    if stop_webcam:
-        st.session_state.webcam_running = False
+        # ── YOLO Video Processor (runs in WebRTC thread) ──
+        class YOLOProcessor(VideoProcessorBase):
+            def __init__(self):
+                self.track_history   = {}
+                self.frame_count     = 0
+                self.all_dets        = []
+                self.unique_ids      = set()
+                self.fps_list        = []
+                self._show_labels    = show_labels
+                self._show_conf      = show_conf
+                self._show_tracks    = show_tracks
+                self._selected_cls   = selected_classes
 
-    if st.session_state.webcam_running:
+            def recv(self, frame):
+                t0  = time.time()
+                img = frame.to_ndarray(format="bgr24")
+
+                annotated, dets, self.track_history = process_frame(
+                    img, model,
+                    self._show_labels, self._show_conf, self._show_tracks,
+                    self.track_history, self._selected_cls, class_names,
+                )
+
+                fps = 1.0 / (time.time() - t0) if (time.time() - t0) > 0 else 0
+                self.frame_count += 1
+                self.fps_list.append(fps)
+                for d in dets:
+                    self.unique_ids.add(d["id"])
+                self.all_dets.extend(dets)
+
+                # FPS overlay
+                cv2.rectangle(annotated, (0, 0), (155, 30), (13, 17, 23), -1)
+                cv2.putText(annotated, f"FPS: {fps:.1f}", (7, 21),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.62, (124, 58, 237), 2)
+
+                # Sync stats to session state
+                with st.session_state.wc_lock:
+                    st.session_state.wc_frames     = self.frame_count
+                    st.session_state.wc_dets       = list(self.all_dets)
+                    st.session_state.wc_unique_ids = set(self.unique_ids)
+                    st.session_state.wc_fps_list   = list(self.fps_list)
+
+                return av.VideoFrame.from_ndarray(
+                    cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), format="rgb24"
+                )
+
+        # ── RTC config with public STUN servers for NAT traversal ──
+        RTC_CONFIG = RTCConfiguration(
+            {"iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]},
+                {"urls": ["stun:stun1.l.google.com:19302"]},
+            ]}
+        )
+
         st.markdown("""
         <div style="background:linear-gradient(90deg,rgba(124,58,237,0.2),rgba(6,182,212,0.1));
              border-radius:12px 12px 0 0; padding:0.65rem 1.1rem;
-             display:flex;align-items:center;gap:0.5rem;border:1px solid rgba(124,58,237,0.2);border-bottom:none;">
+             display:flex;align-items:center;gap:0.5rem;
+             border:1px solid rgba(124,58,237,0.2);border-bottom:none;">
           <span class="video-dot dot-red"></span>
           <span class="video-dot dot-yellow"></span>
           <span class="video-dot dot-green"></span>
@@ -669,97 +843,77 @@ with tab_webcam:
         </div>
         """, unsafe_allow_html=True)
 
-        frame_ph  = st.empty()
-        detect_ph = st.empty()
-        track_history = {}
+        ctx = webrtc_streamer(
+            key="visiontrack-webcam",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIG,
+            video_processor_factory=YOLOProcessor,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
 
-        # Force DirectShow (CAP_DSHOW) on Windows to prevent MSMF crashes
-        if IS_WINDOWS:
-            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        else:
-            cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.markdown('<div class="warn-box">⚠️ Cannot open webcam. Check permissions.</div>', unsafe_allow_html=True)
-            st.session_state.webcam_running = False
-        else:
-            frame_count = 0
-            all_dets = []
-            st.session_state.total_detected   = 0
-            st.session_state.frames_processed = 0
-            st.session_state.unique_ids       = set()
-            st.session_state.fps_list         = []
+        # ── Live stats while streaming ──
+        if ctx.state.playing:
+            with st.session_state.wc_lock:
+                fc   = st.session_state.wc_frames
+                dets = st.session_state.wc_dets
+                uids = st.session_state.wc_unique_ids
+                fps_l= st.session_state.wc_fps_list
+            avg_fps = float(np.mean(fps_l[-30:])) if fps_l else 0.0
+            render_stats(fc, len(dets), len(uids), avg_fps)
 
-            while st.session_state.webcam_running:
-                t0 = time.time()
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            if dets:
+                rows = "".join(f"""
+                <div class="detection-row">
+                  <div class="det-id">#{d['id']}</div>
+                  <div class="det-label">{d['label']}</div>
+                  <div class="conf-bar-wrap">
+                    <div class="conf-bar-fill" style="width:{int(d['conf']*100)}%;"></div>
+                  </div>
+                  <div class="det-conf">{int(d['conf']*100)}%</div>
+                </div>""" for d in dets[-8:])
+                st.markdown(f'<div class="detection-table">{rows}</div>', unsafe_allow_html=True)
 
-                annotated, dets, track_history = process_frame(
-                    frame, model, show_labels, show_conf, show_tracks,
-                    track_history, selected_classes, class_names,
-                )
-                fps = 1.0 / (time.time() - t0) if (time.time() - t0) > 0 else 0
-                frame_count += 1
-                st.session_state.frames_processed = frame_count
-                st.session_state.total_detected  += len(dets)
-                for d in dets:
-                    st.session_state.unique_ids.add(d["id"])
-                st.session_state.fps_list.append(fps)
-                avg_fps = float(np.mean(st.session_state.fps_list[-30:]))
-
-                cv2.rectangle(annotated, (0, 0), (155, 30), (13, 17, 23), -1)
-                cv2.putText(annotated, f"FPS: {fps:.1f}", (7, 21),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.62, (124, 58, 237), 2)
-
-                frame_ph.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                               channels="RGB", use_container_width=True)
-                render_stats(frame_count, st.session_state.total_detected,
-                             len(st.session_state.unique_ids), avg_fps)
-
-                if dets:
-                    all_dets.extend(dets)
-                    rows = "".join(f"""
-                    <div class="detection-row">
-                      <div class="det-id">#{d['id']}</div>
-                      <div class="det-label">{d['label']}</div>
-                      <div class="conf-bar-wrap">
-                        <div class="conf-bar-fill" style="width:{int(d['conf']*100)}%;"></div>
-                      </div>
-                      <div class="det-conf">{int(d['conf']*100)}%</div>
-                    </div>""" for d in dets[:8])
-                    detect_ph.markdown(f'<div class="detection-table">{rows}</div>', unsafe_allow_html=True)
-
-            cap.release()
-
-            # Save session to results
+        elif not ctx.state.playing and st.session_state.wc_frames > 0:
+            # Session just ended — save results
+            with st.session_state.wc_lock:
+                all_dets   = list(st.session_state.wc_dets)
+                frame_count= st.session_state.wc_frames
+                unique_ids = set(st.session_state.wc_unique_ids)
+                fps_list   = list(st.session_state.wc_fps_list)
             if all_dets:
                 label_counts = {}
                 for d in all_dets:
                     label_counts[d["label"]] = label_counts.get(d["label"], 0) + 1
+                avg_fps = round(float(np.mean(fps_list)), 1) if fps_list else 0.0
                 save_result_entry({
-                    "source": "Webcam",
+                    "source": "Webcam (WebRTC)",
                     "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "model": f"{chosen_meta['name']} ({chosen_meta['label']})",
                     "frames": frame_count,
                     "total_detections": len(all_dets),
-                    "unique_ids": len(st.session_state.unique_ids),
-                    "avg_fps": round(avg_fps, 1),
+                    "unique_ids": len(unique_ids),
+                    "avg_fps": avg_fps,
                     "classes_detected": label_counts,
                 })
+                # Reset for next session
+                st.session_state.wc_frames     = 0
+                st.session_state.wc_dets       = []
+                st.session_state.wc_unique_ids = set()
+                st.session_state.wc_fps_list   = []
                 st.markdown('<div class="success-box">✅ Session saved to Results tab.</div>',
                             unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div style="background:var(--bg-card);border:1px solid rgba(124,58,237,0.2);
-                    border-radius:14px;padding:4rem 2rem;text-align:center;">
-          <div style="font-size:3.5rem;margin-bottom:1rem;">📷</div>
-          <div style="font-size:1.05rem;font-weight:600;color:#64748B;">Camera not active</div>
-          <div style="font-size:0.83rem;margin-top:0.4rem;color:#475569;">
-            Click <b style="color:#A78BFA;">▶ Start Webcam</b> to begin live tracking
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div style="background:var(--bg-card);border:1px solid rgba(124,58,237,0.2);
+                        border-radius:0 0 14px 14px;padding:3rem 2rem;text-align:center;">
+              <div style="font-size:3rem;margin-bottom:0.8rem;">📷</div>
+              <div style="font-size:1rem;font-weight:600;color:#64748B;">Camera not active</div>
+              <div style="font-size:0.83rem;margin-top:0.4rem;color:#475569;">
+                Click <b style="color:#A78BFA;">START</b> above — your browser will ask for camera permission
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1,6 +1,10 @@
 # ── Core UI ──────────────────────────────────────────────────────────────────
 streamlit>=1.35.0
 
+# ── Browser WebRTC Webcam (works on Streamlit Cloud & all browsers) ──────────
+streamlit-webrtc>=0.47.0
+av>=12.0.0                  # Video frame decoding required by streamlit-webrtc
+
 # ── Computer Vision & Detection ──────────────────────────────────────────────
 ultralytics>=8.0.0          # YOLOv8 + ByteTracker
 opencv-python-headless>=4.8.0   # Headless OpenCV (no GUI window needed in Streamlit)
