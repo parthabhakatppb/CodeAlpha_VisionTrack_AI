@@ -454,14 +454,52 @@ for key, default in [
         st.session_state[key] = default
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model Loader
+# Model Loader  ─  downloads into the app directory so the file persists
+#                  across reruns within the same deployment session
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _model_path(model_name: str) -> str:
+    """Return the local path where the .pt file lives (or will be saved)."""
+    return os.path.join(MODEL_DIR, model_name)
+
+def _ensure_model(model_name: str) -> str:
+    """
+    Guarantee the .pt file exists in MODEL_DIR.
+    If it is missing, let Ultralytics download it and then copy it
+    from wherever YOLO stored it into MODEL_DIR.
+    Returns the local path.
+    """
+    local = _model_path(model_name)
+    if os.path.exists(local):
+        return local
+
+    # Let YOLO auto-download (goes to its own cache or cwd)
+    tmp_model = YOLO(model_name)           # triggers download
+    src = tmp_model.ckpt_path             # path YOLO actually used
+    if src and os.path.exists(src) and os.path.abspath(src) != os.path.abspath(local):
+        import shutil
+        shutil.copy2(src, local)
+    return local if os.path.exists(local) else src
+
 @st.cache_resource(show_spinner=False)
 def load_model(model_name: str):
-    model_path = os.path.join(MODEL_DIR, model_name)
-    if os.path.exists(model_path):
-        return YOLO(model_path)
-    return YOLO(model_name)
+    """Load (and if necessary download) a YOLOv8 model, cached for the session."""
+    local = _ensure_model(model_name)
+    return YOLO(local)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Startup: pre-download the default (Nano) model so something is
+# always ready immediately — runs once per deployment via cache.
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _predownload_nano():
+    """Silently ensure yolov8n.pt is present at startup."""
+    try:
+        _ensure_model("yolov8n.pt")
+    except Exception:
+        pass  # fail silently; user will see an error when they pick a model
+
+_predownload_nano()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core Detection + Tracking
@@ -597,14 +635,26 @@ with st.sidebar:
         },
     ]
 
-    # Filter to only models present on disk
-    available = [m for m in ALL_MODELS if os.path.exists(os.path.join(MODEL_DIR, m["file"]))]
-    if not available:
-        available = ALL_MODELS  # fallback — YOLO will auto-download
+    # Always show all 5 models — mark which are already cached on disk
+    # (on Streamlit Cloud none will be cached until first use)
+    def _cached(fname):
+        return os.path.exists(os.path.join(MODEL_DIR, fname))
 
-    # Build friendly display labels for the radio (hidden raw names)
-    friendly_labels = [f"{m['name']}  —  {m['label']}" for m in available]
-    default_idx     = next((i for i, m in enumerate(available) if m["file"] == "yolov8m.pt"), 0)
+    # Build labels: cached models show ✅, others show ⬇️ (will auto-download)
+    friendly_labels = [
+        f"{m['name']}  —  {m['label']}  {'✅' if _cached(m['file']) else '⬇️'}"
+        for m in ALL_MODELS
+    ]
+
+    # Default: prefer nano (smallest, always fast to download) on cloud;
+    # prefer medium if it's already cached locally.
+    cached_medium = _cached("yolov8m.pt")
+    if cached_medium:
+        default_idx = next(i for i, m in enumerate(ALL_MODELS) if m["file"] == "yolov8m.pt")
+    else:
+        default_idx = next(i for i, m in enumerate(ALL_MODELS) if m["file"] == "yolov8n.pt")
+
+    st.caption("✅ = cached  ·  ⬇️ = will download on first use")
 
     chosen_label = st.radio(
         "Pick a model:",
@@ -612,7 +662,7 @@ with st.sidebar:
         index=default_idx,
         label_visibility="collapsed",
     )
-    chosen_meta  = available[friendly_labels.index(chosen_label)]
+    chosen_meta  = ALL_MODELS[friendly_labels.index(chosen_label)]
     model_choice = chosen_meta["file"]
 
     # Rich info card for the selected model
@@ -696,17 +746,30 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 # Load Model
 # ─────────────────────────────────────────────────────────────────────────────
-with st.spinner(f"⚡ Loading {chosen_meta['name']} model…"):
+# Show whether this will load from cache or download fresh
+_is_cached = os.path.exists(_model_path(model_choice))
+_action_label = (
+    f"⚡ Loading {chosen_meta['name']} from cache…"
+    if _is_cached
+    else f"⬇️ Downloading {chosen_meta['name']} ({chosen_meta['label']}) — please wait…"
+)
+
+with st.spinner(_action_label):
     try:
         model = load_model(model_choice)
         class_names = list(model.names.values())
         st.markdown(f"""
         <div class="success-box">
-          ✅ <b>{chosen_meta['name']}</b> ({chosen_meta['label']}) loaded — {len(class_names)} classes ready
+          ✅ <b>{chosen_meta['name']}</b> ({chosen_meta['label']}) ready — {len(class_names)} classes
         </div>
         """, unsafe_allow_html=True)
     except Exception as e:
-        st.markdown(f'<div class="warn-box">⚠️ Model load failed: {e}</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="warn-box">
+          ⚠️ Could not load <b>{chosen_meta['name']}</b>: {e}<br>
+          <small>Try selecting a smaller model (⚡ Good / 🚀 Better) which downloads faster.</small>
+        </div>
+        """, unsafe_allow_html=True)
         st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
