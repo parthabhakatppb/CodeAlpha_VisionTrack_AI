@@ -8,6 +8,7 @@ import time
 import json
 import datetime
 import threading
+import queue as _queue
 from ultralytics import YOLO
 from PIL import Image
 
@@ -819,7 +820,7 @@ with tab_webcam:
     st.markdown("""
     <div class="info-box">
       📷 Uses your <b>browser's camera</b> via WebRTC — works on Streamlit Cloud, mobile &amp; desktop.
-      Allow camera access when prompted by your browser.
+      Click <b>START</b> and allow camera permission when your browser asks.
     </div>
     """, unsafe_allow_html=True)
 
@@ -831,68 +832,112 @@ with tab_webcam:
         </div>
         """, unsafe_allow_html=True)
     else:
-        # ── Shared state between WebRTC thread and main thread ──
-        if "wc_lock" not in st.session_state:
-            st.session_state.wc_lock       = threading.Lock()
-            st.session_state.wc_dets       = []
-            st.session_state.wc_frames     = 0
-            st.session_state.wc_unique_ids = set()
-            st.session_state.wc_fps_list   = []
+        # ── RTC config (public Google STUN servers) ──────────────────────────
+        RTC_CONFIG = RTCConfiguration({"iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["stun:stun1.l.google.com:19302"]},
+        ]})
 
-        # ── YOLO Video Processor (runs in WebRTC thread) ──
+        # ════════════════════════════════════════════════════════════════════
+        #  YOLOProcessor  —  KEY ARCHITECTURE:
+        #
+        #   recv()  returns in <1 ms  (never blocks WebRTC)
+        #   A dedicated worker thread runs YOLO at its own pace
+        #   Frames are dropped when the worker is busy (maxsize=1 queue)
+        #   The last annotated frame is returned until the next one is ready
+        # ════════════════════════════════════════════════════════════════════
         class YOLOProcessor(VideoProcessorBase):
             def __init__(self):
-                self.track_history   = {}
-                self.frame_count     = 0
-                self.all_dets        = []
-                self.unique_ids      = set()
-                self.fps_list        = []
-                self._show_labels    = show_labels
-                self._show_conf      = show_conf
-                self._show_tracks    = show_tracks
-                self._selected_cls   = selected_classes
+                # --- queues & state ---
+                self._in_q       = _queue.Queue(maxsize=1)   # 1 pending frame max
+                self._lock       = threading.Lock()
+                self._last_rgb   = None          # latest annotated frame (RGB)
+                self._track_hist = {}
+                # --- per-session stats ---
+                self._frames   = 0
+                self._all_dets = []
+                self._ids      = set()
+                self._fps_buf  = []
+                # --- capture sidebar settings at construction time ---
+                self._show_labels = show_labels
+                self._show_conf   = show_conf
+                self._show_tracks = show_tracks
+                self._sel_cls     = selected_classes
+                # --- start background YOLO worker ---
+                self._running = True
+                self._worker  = threading.Thread(
+                    target=self._yolo_loop, daemon=True
+                )
+                self._worker.start()
 
+            # ─── background thread: YOLO runs here, never touches WebRTC ───
+            def _yolo_loop(self):
+                while self._running:
+                    try:
+                        img = self._in_q.get(timeout=0.5)
+                    except _queue.Empty:
+                        continue
+                    t0 = time.time()
+                    try:
+                        annotated, dets, self._track_hist = process_frame(
+                            img, model,
+                            self._show_labels, self._show_conf, self._show_tracks,
+                            self._track_hist, self._sel_cls, class_names,
+                        )
+                        elapsed = time.time() - t0
+                        fps = 1.0 / max(elapsed, 1e-6)
+
+                        # FPS overlay on the annotated frame
+                        cv2.rectangle(annotated, (0, 0), (160, 30), (13, 17, 23), -1)
+                        cv2.putText(annotated, f"FPS: {fps:.1f}", (7, 21),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (124, 58, 237), 2)
+
+                        rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+                        with self._lock:
+                            self._last_rgb = rgb
+                            self._frames  += 1
+                            self._all_dets.extend(dets)
+                            for d in dets:
+                                self._ids.add(d["id"])
+                            self._fps_buf.append(fps)
+                    except Exception:
+                        pass   # keep running even if one frame fails
+
+            # ─── WebRTC callback: MUST return in milliseconds ───
             def recv(self, frame):
-                t0  = time.time()
                 img = frame.to_ndarray(format="bgr24")
 
-                annotated, dets, self.track_history = process_frame(
-                    img, model,
-                    self._show_labels, self._show_conf, self._show_tracks,
-                    self.track_history, self._selected_cls, class_names,
-                )
+                # Enqueue frame (non-blocking — drop if worker is still busy)
+                try:
+                    self._in_q.put_nowait(img)
+                except _queue.Full:
+                    pass  # worker busy — skip this frame, video stays smooth
 
-                fps = 1.0 / (time.time() - t0) if (time.time() - t0) > 0 else 0
-                self.frame_count += 1
-                self.fps_list.append(fps)
-                for d in dets:
-                    self.unique_ids.add(d["id"])
-                self.all_dets.extend(dets)
+                # Return the latest processed frame (or the raw frame if YOLO
+                # hasn't finished its first inference yet)
+                with self._lock:
+                    out = self._last_rgb
+                if out is None:
+                    out = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-                # FPS overlay
-                cv2.rectangle(annotated, (0, 0), (155, 30), (13, 17, 23), -1)
-                cv2.putText(annotated, f"FPS: {fps:.1f}", (7, 21),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.62, (124, 58, 237), 2)
+                return av.VideoFrame.from_ndarray(out, format="rgb24")
 
-                # Sync stats to session state
-                with st.session_state.wc_lock:
-                    st.session_state.wc_frames     = self.frame_count
-                    st.session_state.wc_dets       = list(self.all_dets)
-                    st.session_state.wc_unique_ids = set(self.unique_ids)
-                    st.session_state.wc_fps_list   = list(self.fps_list)
+            # ─── Called when the WebRTC stream stops ───
+            def on_ended(self):
+                self._running = False
 
-                return av.VideoFrame.from_ndarray(
-                    cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), format="rgb24"
-                )
+            # ─── Thread-safe snapshot of current stats ───
+            def snapshot(self):
+                with self._lock:
+                    return (
+                        self._frames,
+                        list(self._all_dets),
+                        set(self._ids),
+                        list(self._fps_buf),
+                    )
 
-        # ── RTC config with public STUN servers for NAT traversal ──
-        RTC_CONFIG = RTCConfiguration(
-            {"iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]},
-                {"urls": ["stun:stun1.l.google.com:19302"]},
-            ]}
-        )
-
+        # ── Camera feed header bar ───────────────────────────────────────────
         st.markdown("""
         <div style="background:linear-gradient(90deg,rgba(124,58,237,0.2),rgba(6,182,212,0.1));
              border-radius:12px 12px 0 0; padding:0.65rem 1.1rem;
@@ -901,31 +946,67 @@ with tab_webcam:
           <span class="video-dot dot-red"></span>
           <span class="video-dot dot-yellow"></span>
           <span class="video-dot dot-green"></span>
-          <span style="color:#94A3B8;font-size:0.8rem;margin-left:0.4rem;">Live Camera Feed</span>
+          <span style="color:#94A3B8;font-size:0.8rem;margin-left:0.4rem;">Live Camera Feed  (YOLO annotated)</span>
           <span class="live-badge">● LIVE</span>
         </div>
         """, unsafe_allow_html=True)
 
+        # ── WebRTC streamer ──────────────────────────────────────────────────
         ctx = webrtc_streamer(
             key="visiontrack-webcam",
             mode=WebRtcMode.SENDRECV,
             rtc_configuration=RTC_CONFIG,
             video_processor_factory=YOLOProcessor,
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
+            # Lower resolution + FPS → faster YOLO inference
+            media_stream_constraints={
+                "video": {
+                    "width":     {"ideal": 640,  "max": 1280},
+                    "height":    {"ideal": 480,  "max": 720},
+                    "frameRate": {"ideal": 15,   "max": 30},
+                },
+                "audio": False,
+            },
+            # async_processing=False: recv() is called synchronously;
+            # our queue makes it return in <1 ms so this is safe.
+            async_processing=False,
         )
 
-        # ── Live stats while streaming ──
-        if ctx.state.playing:
-            with st.session_state.wc_lock:
-                fc   = st.session_state.wc_frames
-                dets = st.session_state.wc_dets
-                uids = st.session_state.wc_unique_ids
-                fps_l= st.session_state.wc_fps_list
-            avg_fps = float(np.mean(fps_l[-30:])) if fps_l else 0.0
-            render_stats(fc, len(dets), len(uids), avg_fps)
+        # ── Live stats (reads processor state directly) ──────────────────────
+        stats_ph  = st.empty()
+        detect_ph = st.empty()
 
-            if dets:
+        if ctx.state.playing and ctx.video_processor:
+            frames, all_dets, ids, fps_buf = ctx.video_processor.snapshot()
+            avg_fps = float(np.mean(fps_buf[-30:])) if fps_buf else 0.0
+
+            stats_ph.markdown(f"""
+            <div class="stats-grid">
+              <div class="stat-card">
+                <div class="stat-icon">🖼️</div>
+                <div class="stat-value">{frames:,}</div>
+                <div class="stat-label">Frames Processed</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-icon">🔍</div>
+                <div class="stat-value">{len(all_dets):,}</div>
+                <div class="stat-label">Total Detections</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-icon">🆔</div>
+                <div class="stat-value">{len(ids)}</div>
+                <div class="stat-label">Unique IDs Tracked</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-icon">⚡</div>
+                <div class="stat-value">{avg_fps:.1f}</div>
+                <div class="stat-label">Avg FPS</div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Show last 8 detections
+            recent = all_dets[-8:] if all_dets else []
+            if recent:
                 rows = "".join(f"""
                 <div class="detection-row">
                   <div class="det-id">#{d['id']}</div>
@@ -934,49 +1015,49 @@ with tab_webcam:
                     <div class="conf-bar-fill" style="width:{int(d['conf']*100)}%;"></div>
                   </div>
                   <div class="det-conf">{int(d['conf']*100)}%</div>
-                </div>""" for d in dets[-8:])
-                st.markdown(f'<div class="detection-table">{rows}</div>', unsafe_allow_html=True)
+                </div>""" for d in recent)
+                detect_ph.markdown(
+                    f'<div class="detection-table">{rows}</div>',
+                    unsafe_allow_html=True
+                )
 
-        elif not ctx.state.playing and st.session_state.wc_frames > 0:
-            # Session just ended — save results
-            with st.session_state.wc_lock:
-                all_dets   = list(st.session_state.wc_dets)
-                frame_count= st.session_state.wc_frames
-                unique_ids = set(st.session_state.wc_unique_ids)
-                fps_list   = list(st.session_state.wc_fps_list)
-            if all_dets:
-                label_counts = {}
-                for d in all_dets:
-                    label_counts[d["label"]] = label_counts.get(d["label"], 0) + 1
-                avg_fps = round(float(np.mean(fps_list)), 1) if fps_list else 0.0
-                save_result_entry({
-                    "source": "Webcam (WebRTC)",
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "model": f"{chosen_meta['name']} ({chosen_meta['label']})",
-                    "frames": frame_count,
-                    "total_detections": len(all_dets),
-                    "unique_ids": len(unique_ids),
-                    "avg_fps": avg_fps,
-                    "classes_detected": label_counts,
-                })
-                # Reset for next session
-                st.session_state.wc_frames     = 0
-                st.session_state.wc_dets       = []
-                st.session_state.wc_unique_ids = set()
-                st.session_state.wc_fps_list   = []
-                st.markdown('<div class="success-box">✅ Session saved to Results tab.</div>',
-                            unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div style="background:var(--bg-card);border:1px solid rgba(124,58,237,0.2);
-                        border-radius:0 0 14px 14px;padding:3rem 2rem;text-align:center;">
-              <div style="font-size:3rem;margin-bottom:0.8rem;">📷</div>
-              <div style="font-size:1rem;font-weight:600;color:#64748B;">Camera not active</div>
-              <div style="font-size:0.83rem;margin-top:0.4rem;color:#475569;">
-                Click <b style="color:#A78BFA;">START</b> above — your browser will ask for camera permission
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
+        elif not ctx.state.playing:
+            # ── Session ended: save results if we have any ───────────────────
+            proc = getattr(ctx, "video_processor", None)
+            if proc is not None:
+                frames, all_dets, ids, fps_buf = proc.snapshot()
+                if all_dets and frames > 0:
+                    label_counts = {}
+                    for d in all_dets:
+                        label_counts[d["label"]] = label_counts.get(d["label"], 0) + 1
+                    avg_fps = round(float(np.mean(fps_buf)), 1) if fps_buf else 0.0
+                    save_result_entry({
+                        "source": "Webcam (WebRTC)",
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "model": f"{chosen_meta['name']} ({chosen_meta['label']})",
+                        "frames": frames,
+                        "total_detections": len(all_dets),
+                        "unique_ids": len(ids),
+                        "avg_fps": avg_fps,
+                        "classes_detected": label_counts,
+                    })
+                    st.markdown(
+                        '<div class="success-box">✅ Session saved to Results tab.</div>',
+                        unsafe_allow_html=True
+                    )
+            else:
+                # No processor yet — show idle placeholder
+                st.markdown("""
+                <div style="background:var(--bg-card);border:1px solid rgba(124,58,237,0.2);
+                            border-radius:0 0 14px 14px;padding:3rem 2rem;text-align:center;">
+                  <div style="font-size:3rem;margin-bottom:0.8rem;">📷</div>
+                  <div style="font-size:1rem;font-weight:600;color:#64748B;">Camera not active</div>
+                  <div style="font-size:0.83rem;margin-top:0.5rem;color:#475569;">
+                    Click <b style="color:#A78BFA;">START</b> above and allow camera permission.
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
