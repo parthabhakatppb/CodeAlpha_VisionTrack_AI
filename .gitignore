@@ -1,0 +1,28 @@
+# YOLOv8 model weights (too large for GitHub — download via download_models.py)
+*.pt
+*.pth
+*.onnx
+
+# Auto-generated results log
+results_log.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+env/
+.env
+.venv/
+
+# Output video
+output.mp4
+
+# Nested repo clone artifact
+parthabhakatppb-CodeAlpha_VisionTrack_AI/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
