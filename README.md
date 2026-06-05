@@ -317,3 +317,5 @@ MIT License — free for personal and commercial use.
 <div align="center">
   Built with ❤️ using YOLOv8 + ByteTracker + Streamlit
 </div>
+#   C o d e A l p h a _ V i s i o n T r a c k _ A I  
+ 
