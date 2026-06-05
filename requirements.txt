@@ -1,24 +1,25 @@
-# ── Core UI ──────────────────────────────────────────────────────────────────
+# ── Core UI ───────────────────────────────────────────────────────────────────
 streamlit>=1.35.0
 
-# ── Browser WebRTC Webcam (works on Streamlit Cloud & all browsers) ──────────
-streamlit-webrtc>=0.47.0
-av>=12.0.0                  # Video frame decoding required by streamlit-webrtc
+# ── Browser WebRTC Webcam ─────────────────────────────────────────────────────
+# Pinned to exact versions with pre-built wheels for Linux x86_64 / Python 3.11
+streamlit-webrtc==0.47.4
+av==10.0.0
 
-# ── Computer Vision & Detection ──────────────────────────────────────────────
-ultralytics>=8.0.0          # YOLOv8 + ByteTracker
-opencv-python-headless>=4.8.0   # Headless OpenCV (no GUI window needed in Streamlit)
+# ── Computer Vision & Detection ───────────────────────────────────────────────
+ultralytics>=8.0.0
+opencv-python-headless>=4.8.0
 
-# ── Deep Learning ─────────────────────────────────────────────────────────────
-torch>=2.0.0
-torchvision>=0.15.0
+# ── Deep Learning (CPU build — Streamlit Cloud has no GPU) ────────────────────
+torch==2.1.0
+torchvision==0.16.0
 
 # ── Data & Image Handling ─────────────────────────────────────────────────────
 numpy>=1.24.0
 Pillow>=10.0.0
-pandas>=2.0.0               # Results table, CSV export
+pandas>=2.0.0
 
-# ── Networking (upgraded to fix urllib3/chardet warnings) ────────────────────
-requests>=2.34.2
-urllib3>=2.7.0
-charset-normalizer>=3.4.7
+# ── Networking ────────────────────────────────────────────────────────────────
+requests>=2.31.0
+urllib3>=2.0.0
+charset-normalizer>=3.3.0
